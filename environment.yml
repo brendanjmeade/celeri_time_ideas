@@ -1,0 +1,36 @@
+name: celeri_time_ideas
+channels:
+  - conda-forge
+dependencies:
+  - numpy
+  - scipy
+  - matplotlib
+  - obspy
+  - scikit-learn
+  - pyproj
+  - pandas
+  - jupyterlab
+  - ipympl
+  - meshio
+  - cloudpickle
+  - pytest
+  - addict
+  - tqdm
+  - h5py
+  - colorcet
+  - lxml
+  - rich
+  - cvxpy
+  - cvxopt
+  - compilers
+  - fortran-compiler
+  - cutde
+  - ghostscript
+  - spherical-geometry
+  - loguru
+  - pygmt
+  - gmsh
+  - polars
+  - seaborn
+  - pip
+
