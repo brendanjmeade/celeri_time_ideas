@@ -17,19 +17,17 @@ The files are:
 
 - `model_test_001.pkl`: A data file with a synethetic single fault 2D forward velocities
 
-- `demo_variational.ipynb`: A notebook that applies a variational (batch) approach to time series estimation.   Coseismic jumps are subtracted out before analysis.  Still this approach treats the 
+- `demo_variational_admm.ipynb`: A notebook that applies a variational (batch) approach to time series estimation.   Coseismic jumps are subtracted out before analysis.  Still this approach treats the data in two batches, pre- and post-earthquake.
 
 - `state_space_playground.ipynb`:
 
-- `smoothing_time_series.ipynb`:
-
-- `omg_10.py`:
+- `demo_nnls_tikhonove.ipynb`: Non-negative least squares at every time step with Tikhonove smoothing in time.  Super simple but tends to exhibit oscillations
 
 - `omg_10.ipynb`:
 
-- `imm_with_smoother.ipynb`:
+- `demo_imm_with_smoother.ipynb`:  A notebook that applies a variational (batch) approach to time series estimation.   Coseismic jumps explicitly modeled here as a part of the time series analytis.  This might work even better with them subtracted out.
 
-- `batch_smooth_time.ipynb`:
+- `demo_variational.ipynb`:  Similar to `demo_variational_admm.ipynb` but slower because it doesn't use ADMM.
 
 - `admm_05_c_04.ipynb`:
 
