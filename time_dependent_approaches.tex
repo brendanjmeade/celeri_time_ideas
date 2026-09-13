@@ -1,0 +1,379 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\lstset{basicstyle=\ttfamily\small, columns=fullflexible, keepspaces=true}
+
+\newcommand{\vect}[1]{\bm{#1}}
+\newcommand{\mat}[1]{\mathbf{#1}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\code}[1]{\texttt{#1}}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator{\prox}{prox}
+\DeclareMathOperator{\logit}{logit}
+\DeclareMathOperator{\diag}{diag}
+
+\title{Combining Bounded Single-Epoch Kinematic Block Models\\into Time-Dependent Estimates of Fault Coupling}
+\author{Brendan J. Meade}
+\date{September 2026 \\[2pt] \small Working document}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+\code{celeri} now routinely produces bounded kinematic block models, in which fault coupling on triangular meshes is constrained to lie in a prescribed interval, at many epochs. The scientific goal is to track the evolution of coupling and block motion in time: slow slip transients, coseismic steps, afterslip, and long-term rate changes. This document describes six approaches to combining a sequence of highly constrained single-epoch solutions into a coherent time-dependent estimate, states the assumptions each requires, and recommends which to pursue. Two facts shape every recommendation. First, a bounded estimate is the mode of a truncated distribution, so naive smoothing across epochs is biased wherever bounds are active. Second, the expensive parts of a \code{celeri} run do not depend on the observed velocities, so time dependence done correctly amortizes the cost of a single static run rather than multiplying it. Three features of our problem then narrow the field: coupling bounds are known but differ at every epoch, bounds apply on every mesh, and block rotations may change from epoch to epoch. Together these rule out localizing the problem to one mesh and rule out linearizing the coupling bound by fixing rotations, and they leave two production candidates to be settled by benchmark: warm-started bounded quadratic programs coupled across epochs by consensus ADMM, or a sigmoid-parameterized maximum a posteriori fit on compressed sufficient statistics.
+\end{abstract}
+
+\section{Problem statement}
+
+A kinematic block model predicts interseismic surface velocities as the sum of rigid block rotations and the elastic effect of partial fault coupling. In \code{celeri} the unknown state at one epoch is
+\begin{equation}
+\vect{x} = \bigl[\, \vect{\omega} \;\big|\; \vect{a} \;\big|\; \vect{\epsilon} \;\big|\; \vect{\mu} \,\bigr],
+\end{equation}
+where $\vect{\omega} \in \mathbb{R}^{3 n_b}$ holds one rotation vector per block, $\vect{a}$ holds the coefficients of the elastic slip rate on each triangular mesh in a truncated Mat\'ern eigenmode basis, and $\vect{\epsilon}$ and $\vect{\mu}$ hold block strain rates and Mogi source strengths. Observations $\vect{d}$ are station velocities with diagonal weights $\mat{W}$, and the forward model is linear, $\vect{d} \approx \mat{G}\vect{x}$.
+
+The physically meaningful derived quantity is the kinematic coupling on each triangle $j$,
+\begin{equation}
+\kappa_j = \frac{e_j}{k_j}, \qquad \vect{e} = \mat{E}\vect{a}, \qquad \vect{k} = \mat{S}\mat{R}\vect{\omega},
+\label{eq:coupling}
+\end{equation}
+where $\mat{E}$ maps eigenmode coefficients to triangle slip rates, $\mat{R}$ projects the relative rotation of the flanking blocks onto each triangle, and $\mat{S}$ is a spatial smoother applied to the kinematic rate. The bounded solve enforces $\kappa_{\mathrm{lo}} \le \kappa_j \le \kappa_{\mathrm{hi}}$, typically $[0,1]$. Because $\kappa_j$ is a ratio of two linear functions of the state, the constraint is bilinear. \code{celeri} convexifies it as a ``bowtie'' envelope in the $(k_j, e_j)$ plane, anchored at a pair of kinematic rates that are tightened over roughly twenty sequential quadratic programming (SQP) iterations until the true constraint is satisfied.
+
+We now have a sequence of such solutions, $\vect{x}_1^\ast, \dots, \vect{x}_T^\ast$, one per epoch, each obtained from a velocity field estimated over a non-overlapping time interval with identical block and mesh geometry. The question is how to combine them meaningfully. We take ``meaningfully'' to require three things at once:
+\begin{enumerate}[nosep]
+\item the result respects the same bounds that each single-epoch solution respects;
+\item the result carries a stated temporal prior rather than an accidental one;
+\item the quantities compared across epochs are actually comparable.
+\end{enumerate}
+
+\section{Two facts that constrain every approach}
+
+\subsection{Bounded estimates are truncated posteriors}
+
+The SQP returns the mode of a distribution truncated at the coupling box. On a fully locked triangle, $\kappa_j = 1$, the estimate sits on the bound and the posterior has essentially zero width in the direction normal to the bound. The unconstrained covariance from a dense least-squares solve is wrong in exactly those directions, and the SQP path returns no covariance at all.
+
+The consequence is that any naive average or smoother of single-epoch solutions is biased toward the interior of the box. If a locked patch dips to $\kappa_j = 0.9$ in one noisy epoch, a smoother drags neighboring epochs below $1$ even though each of them was correctly pinned at the bound. Combination must therefore either re-impose the bounds after fusion, accepting some loss of smoothness, or impose the bounds and the temporal prior jointly.
+
+\subsection{The eigenmode basis is not pinned}
+
+The Mat\'ern eigendecomposition is recomputed from scratch on every model build, and the sign of each eigenvector is arbitrary. Near-degenerate eigenvalues can also reorder. Coefficient vectors $\vect{a}$ from two independent runs are therefore not comparable even when every input except the station velocities is identical. Coupling $\kappa_j$ is basis-invariant and is comparable; anything done in coefficient space requires a frozen basis, built once and reused for every epoch.
+
+\section{The cost model}
+\label{sec:cost}
+
+Individual bounded runs on the largest current models take days to weeks and about one terabyte of memory. This fact dominates the choice of method, so it is worth stating precisely where the cost lies.
+
+Nothing in the expensive part of a run depends on the observed velocities. The cost is in (i) the elastic operator build; (ii) the per-mesh eigendecomposition; (iii) the dense weighted operator $\mat{C} = \mat{W}^{1/2}\mat{G}$, its economic QR factorization, and associated copies, each tens of gigabytes at the $10^5$-station scale; and (iv) the SQP loop, which re-solves the bounded quadratic program roughly twenty times. Only $\vect{d}_t$, and possibly $\mat{W}_t$, changes between epochs.
+
+A design that reruns the full pipeline once per epoch therefore repeats identical work $T$ times. Done correctly, $T$ epochs should cost about one static run plus $T$ inexpensive steps. Four structural savings follow.
+
+\paragraph{S1: Compress each epoch to sufficient statistics.}
+The Gaussian misfit depends on the data only through objects of size $n_{\mathrm{params}}$:
+\begin{equation}
+\norm{\mat{C}\vect{x} - \vect{d}_t}^2 = \norm{\mat{R}\vect{x} - \mat{Q}^{\!\top}\vect{d}_t}^2 + \text{const}
+= \vect{x}^{\!\top}\mat{H}\vect{x} - 2\vect{g}_t^{\!\top}\vect{x} + \text{const},
+\label{eq:suffstat}
+\end{equation}
+with $\mat{C} = \mat{Q}\mat{R}$ the thin QR factorization, $\mat{H} = \mat{C}^{\!\top}\mat{C}$, and $\vect{g}_t = \mat{C}^{\!\top}\vect{d}_t$. If weights are shared across epochs, $\mat{R}$ is computed once and each epoch adds one matrix-vector product. If weights differ, $\mat{H}_t = \mat{G}^{\!\top}\mat{W}_t\mat{G}$ is one matrix product per epoch followed by a Cholesky factorization. The raw data rows never enter the optimizer, and no per-epoch object is larger than $n_{\mathrm{params}}^2$. Every approach below, including the Bayesian likelihood, consumes these statistics unchanged.
+
+The first and fourth savings below apply to our problem unconditionally. The second and third are stated because they are large when available, but Section~\ref{sec:actual} shows that neither applies to our problem as posed, and gives their replacements.
+
+\paragraph{S2 (conditional): Fix block rotations so the coupling bound becomes linear.}
+The bowtie exists only because $\vect{k}$ depends on $\vect{\omega}$. If $\vect{\omega}$ is frozen at the static solution, $\vect{k}$ is a known vector and the constraint
+\begin{equation}
+\kappa_{\mathrm{lo}}\, k_j \le (\mat{E}\vect{a}_t)_j \le \kappa_{\mathrm{hi}}\, k_j
+\label{eq:linearbound}
+\end{equation}
+is a plain linear inequality in $\vect{a}_t$. There is no SQP loop: one quadratic program per epoch, or one joint program, instead of twenty. Block motion in time is then recovered either as a piecewise-constant $\vect{\omega}$ re-estimated across earthquakes, or as a perturbation $\vect{\omega}_t = \vect{\omega}_0 + \Delta\vect{\omega}_t$ with a strong prior, for which one or two anchor iterations warm-started from the static anchors suffice.
+
+\paragraph{S3 (conditional): Localize the time-dependent problem.}
+Transients are spatially local. Hold every mesh except the target at its static solution, subtract the static prediction from the data, and solve for time dependence only in the target-mesh coefficients:
+\begin{equation}
+\vect{r}_t = \vect{d}_t - \mat{G}\vect{x}_{\mathrm{static}}, \qquad \vect{r}_t \approx \mat{G}_{\mathrm{target}}\,\Delta\vect{a}_t + \text{noise}.
+\end{equation}
+The problem shrinks from hundreds of meshes and $10^5$ triangles to one mesh and a few hundred coefficients. Regularize $\Delta\vect{a}_t$ toward zero using the eigenvalue spectrum, and monitor residuals on non-target meshes each epoch; if they trend, widen the target set.
+
+\paragraph{S4: Never rebuild data-independent work.}
+Build the model and operators once, pin the eigenbasis, cache $\mat{R}$ or $\mat{H}$ to disk, and construct the optimization problem once with $\mat{Q}^{\!\top}\vect{d}_t$ as a parameter.
+
+\section{Prerequisites common to all approaches}
+
+\begin{enumerate}[nosep]
+\item \textbf{Frozen basis and operators.} Build the model and operators once per geometry; for each epoch swap only the station table. Longer term, pin the basis inside \code{celeri} by sorting on eigenvalue, fixing sign so the largest-magnitude component is positive, and caching to disk.
+\item \textbf{Union station set.} Build on the union of all stations and assign zero weight to stations absent in a given epoch, so row indexing is stable and the elastic operator cache is never invalidated.
+\item \textbf{Coupling with a mask.} Where $|k_j|$ is small the ratio in \eqref{eq:coupling} is undefined. Track a kinematically resolvable mask and report coupling only there.
+\item \textbf{Coseismic convention.} If epoch velocities already have coseismic offsets removed, no step parameters are needed but temporal penalties must be exempted across the earthquake epoch. If offsets are retained, add a free step vector at each known earthquake. Afterslip is a rate and lives in the ordinary state; the post-event coupling lower bound may need to be negative on afterslip patches.
+\item \textbf{Epoch independence.} Epochs from non-overlapping intervals are conditionally independent. If overlapping sliding windows were used instead, adjacent epochs would share raw displacements and covariances would need inflating by roughly the ratio of window length to stride.
+\end{enumerate}
+
+\section{Six approaches}
+
+Throughout, $\vect{a}_t$ denotes the (target-mesh) coefficients at epoch $t$, $\Delta\vect{a}_t = \vect{a}_{t+1} - \vect{a}_t$, and $\mathcal{K}_t$ denotes the feasible set at epoch $t$: the coupling bounds, any elastic slip-rate boxes, and segment slip-rate constraints.
+
+\subsection{Approach 1: Post-hoc fusion of already-solved epochs}
+
+This uses only the runs that already exist and requires no new solves. It is the right first diagnostic. Two variants.
+
+\paragraph{1a. Coupling-space smoothing per triangle.}
+For each triangle map the coupling series into the open interval,
+\begin{equation}
+u_j(t) = \logit\!\left(\frac{\kappa_j(t) - \kappa_{\mathrm{lo}}}{\kappa_{\mathrm{hi}} - \kappa_{\mathrm{lo}}}\right),
+\end{equation}
+smooth $u_j(t)$ in one dimension (a Gaussian process with a squared-exponential kernel plus a step kernel at known earthquakes, or a one-dimensional total-variation denoiser for onset detection), and invert. Bounds hold by construction. The cost is $n_{\mathrm{tri}}$ independent one-dimensional problems. It ignores spatial coherence and the trade-off between rotations and coupling, and it needs a per-triangle noise level, best taken from the diagonal of $\mat{J}\mat{\Sigma}_t\mat{J}^{\!\top}$ with $\mat{J} = \partial\vect{\kappa}/\partial\vect{x}$. It is a monitoring product, not a posterior.
+
+\paragraph{1b. Information-form fusion in coefficient space.}
+Treat each $\vect{x}_t^\ast$ as a pseudo-observation with covariance $\mat{\Sigma}_t$, apply a linear-Gaussian smoother (Rauch--Tung--Striebel, per-coefficient Gaussian process regression, or a fused lasso), then re-project once into $\mathcal{K}_t$. The appropriate $\mat{\Sigma}_t$ is the reduced Hessian on the inactive constraint set at the optimum. With $\mat{A}_{\mathrm{act}}$ the active constraint rows and $\mat{N}$ a basis for their null space,
+\begin{equation}
+\mat{\Sigma}_t = \mat{N}\bigl(\mat{N}^{\!\top}\mat{H}_t\mat{N}\bigr)^{-1}\mat{N}^{\!\top}.
+\label{eq:reducedhessian}
+\end{equation}
+This is a Laplace approximation on the active face. It is valid where bounds are inactive or the solution lies in the interior of a face. Where many bounds are active the fused mean leaks outside the box and the final re-projection partially undoes the smoothing. That failure is informative: it maps where a joint method is needed.
+
+\subsection{Approach 2: Consensus ADMM reusing the single-epoch solve}
+
+This is the rigorous version of ``combine the per-epoch solutions.'' Split the joint objective into per-epoch terms $f_t$, each exactly the existing bounded problem, and a temporal term $g$:
+\begin{align}
+f_t(\vect{x}_t) &= \norm{\mat{C}_t\vect{x}_t - \vect{d}_t}^2 + \mathbb{I}_{\mathcal{K}_t}(\vect{x}_t), \\
+g(\vect{z}) &= \lambda\, \mathcal{R}(\vect{z}_a) + \mathbb{I}\{\vect{z}_{\omega,t} \text{ equal within each interseismic segment}\}.
+\end{align}
+With consensus $\vect{x}_t = \vect{z}_t$, scaled duals $\vect{u}_t$, and penalty $\rho$, the iteration is
+\begin{align}
+\vect{x}_t^{k+1} &= \argmin_{\vect{x} \in \mathcal{K}_t}\; \norm{\mat{C}_t\vect{x} - \vect{d}_t}^2 + \tfrac{\rho}{2}\norm{\vect{x} - (\vect{z}_t^k - \vect{u}_t^k)}^2
+&& \text{(per epoch, parallel)} \label{eq:admm-x}\\
+\vect{z}^{k+1} &= \prox_{g/\rho}\!\bigl(\vect{x}^{k+1} + \vect{u}^k\bigr)
+&& \text{(temporal step, } O(T) \text{ per mode)} \\
+\vect{u}^{k+1} &= \vect{u}^k + \vect{x}^{k+1} - \vect{z}^{k+1}.
+\end{align}
+The $\vect{x}$-step is the existing problem plus one proximal term. The $\vect{z}$-step is separable per mode across time: first-difference Tikhonov is a tridiagonal solve, total variation is a direct one-dimensional fused-lasso algorithm, and static or piecewise-constant rotations reduce to averaging within each segment. The first iterate with $\vect{u} = 0$, $\vect{z} = \vect{x}$ is exactly the set of independent per-epoch solves, so Approach 1 is its natural initializer.
+
+Two caveats. The bowtie is non-convex until the kinematic anchors share a sign; freeze anchors after a few outer iterations, after which every subproblem is convex and standard ADMM convergence applies. And at full scale, wrapping the current single-epoch solver in this loop multiplies a week-long solve by $T \times K$ iterations. The method is viable only on the compressed and localized subproblem of Section~\ref{sec:cost}.
+
+\subsection{Approach 3: Joint multi-epoch convex program}
+
+Solve one problem over all epochs. Variables are $\vect{\omega}_s$ per interseismic segment $s$ (rotations piecewise constant across earthquakes), $\vect{a}_t$ per epoch, and optional free step vectors $\vect{\delta}_j$ at known earthquake epochs:
+\begin{equation}
+\begin{aligned}
+\min \quad & \sum_t \norm{\mat{C}_t\vect{x}_t - \vect{d}_t}^2 + \lambda\,\mathcal{R}(\vect{a}_1,\dots,\vect{a}_T) + \text{segment penalties on } \vect{\omega}_s \\
+\text{s.t.} \quad & \text{coupling bounds on } \bigl(\vect{k}(\vect{\omega}_{s(t)}),\, \mat{E}\vect{a}_t\bigr) \text{ for every } t \text{ and mesh}, \\
+& \text{elastic boxes for every } t.
+\end{aligned}
+\end{equation}
+Because the kinematic rate is the same expression for every epoch within a segment, one set of bowtie constraint parameters is shared by all epochs. With rotations fixed (S2), the constraints are the linear inequalities \eqref{eq:linearbound} and no SQP loop is needed.
+
+The temporal regularizer $\mathcal{R}$ selects the class of behavior recovered (Table~\ref{tab:regularizers}). Earthquake differences are exempted. A sensible default is total variation plus a small first-difference Tikhonov term, which removes staircase artifacts.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+$\mathcal{R}$ & Behavior in time & Notes \\
+\midrule
+$\sum_t \norm{\Delta\vect{a}_t}_2^2$ & smooth, low-pass & leaks steps \\
+$\sum_t \norm{\Delta^2\vect{a}_t}_2^2$ & piecewise-linear trends & preserves constant-rate drift \\
+$\sum_t \norm{\Delta\vect{a}_t}_1$ & piecewise constant per mode & locked-then-unlocked \\
+$\sum_t \norm{\Delta\vect{a}_t}_2$ & few epochs where all modes change & unknown-onset transients \\
+$\sum_t \norm{\mat{\Lambda}^{-1/2}\Delta\vect{a}_t}_2^2$ & high-order modes stiffer in time & $\mat{\Lambda}$ = Mat\'ern eigenvalues \\
+\bottomrule
+\end{tabular}
+\caption{Temporal regularizers and the behavior each selects.}
+\label{tab:regularizers}
+\end{table}
+
+At full scale the problem is out of reach: roughly $T \times 10^6$ constraint rows. On the localized problem it is entirely feasible, with $T \times n_{\mathrm{target\ modes}}$ variables and on the order of $10^6$ rows at fifty epochs. It is the exact reference against which Approach 2 is validated.
+
+\paragraph{Why the earlier NNLS-plus-Tikhonov prototype oscillated.}
+It used projected gradient descent with a fixed step of $10^{-3}$ for 300 iterations from a noisy per-step initialization; its effective smoothing time was about $1.5$, so what was plotted was the unconverged initialization. The exact minimizer of a quadratic misfit plus a first-difference penalty is a low-pass filter of the data and cannot oscillate more than the data does.
+
+\subsection{Approach 4: Low-rank temporal basis}
+
+Parameterize the coefficient trajectory in a small temporal basis,
+\begin{equation}
+\vect{a}_t = \bar{\vect{a}} + \sum_{k=1}^{K} \Phi_{tk}\,\vect{\beta}_k + \sum_j H(t \ge t_j)\,\vect{\delta}_j,
+\end{equation}
+with $\mat{\Phi} \in \mathbb{R}^{T \times K}$ either cubic B-splines with knots every few epochs, or the leading eigenvectors of a squared-exponential Gaussian process kernel in time with the constant mode removed (the construction used in the existing PyMC prototype: seven modes and a length scale of about twenty days). Variables shrink to $(K+1)\,n_{\mathrm{modes}}$; constraints remain per epoch, so the row count does not shrink, but the KKT system is far smaller. Smoothness is implicit; a prior $\sum_k \norm{\vect{\beta}_k}^2$ plays the role of the Gaussian process amplitude. It is weak for steps unless knots are dense and cannot detect unknown earthquakes. Its value is speed for exploration and the fact that it is the MAP analogue of Approach 6, so the two are directly comparable.
+
+\subsection{Approach 5: Constrained Kalman filter whose update is the bounded solve}
+
+For streaming, as epochs arrive. Let the state follow a random walk with process covariance $\mat{Q} = \diag(q_\omega\mat{I},\; q_a\mat{\Lambda}^{-1},\;\dots)$, so that high-order Mat\'ern modes are stiffer in time. At a known earthquake epoch, schedule a large $\mat{Q}$ on the coseismic partition; this replaces a hidden jump mode with a deterministic one. The measurement update is a weighted least-squares problem and is therefore exactly the existing bounded solve with an added prior term:
+\begin{equation}
+\min_{\vect{x} \in \mathcal{K}_t}\; \norm{\mat{W}^{1/2}(\mat{G}\vect{x} - \vect{z}_t)}^2 + \norm{\mat{L}^{\!\top}(\vect{x} - \vect{x}^-)}^2, \qquad \mat{L}\mat{L}^{\!\top} = (\mat{P}^-)^{-1}.
+\label{eq:ckf}
+\end{equation}
+Implement by stacking $\mat{L}^{\!\top}$ under $\mat{G}$ and $\mat{L}^{\!\top}\vect{x}^-$ under $\vect{z}_t$ with unit weights, or equivalently by adding $(\mat{P}^-)^{-1}$ to $\mat{H}$ and $(\mat{P}^-)^{-1}\vect{x}^-$ to $\vect{g}_t$ in the compressed form \eqref{eq:suffstat}. After the update, take the covariance from the reduced Hessian \eqref{eq:reducedhessian}. The Rauch--Tung--Striebel smoother output is not guaranteed feasible; use it as the prior and warm start for one joint constrained pass (Approach 2 or 3). Only $\mat{Q}$ needs tuning.
+
+This also explains why the earlier interacting-multiple-model prototype lingered in its jump state. With an active bound, the smooth and jump modes produce nearly identical innovations, so the mode likelihoods carry no information and the Markov transition prior dominates. Scheduled jumps at known epochs, and sparse-jump priors (Approaches 3 and 6) for unknown ones, avoid the problem rather than tuning around it.
+
+\subsection{Approach 6: Hierarchical Bayesian space-time model}
+
+Extend the existing Markov chain Monte Carlo path, which already places a Gaussian process on eigenmode coefficients and squashes it into the bounds with a sigmoid or softplus transform, so that the coefficient vector becomes a space-time matrix:
+\begin{equation}
+\begin{aligned}
+\mat{Z} &\sim \mathcal{N}(0, 1) \quad \text{elementwise, shape } (n_{\mathrm{modes}}, K), \\
+\vect{c}(t) &= \bigl(\vect{\sigma}_{\mathrm{space}} \odot \mat{Z} \odot \vect{\sigma}_{\mathrm{time}}^{\!\top}\bigr)\, \mat{\Phi}(t)^{\!\top}, \\
+\vect{\kappa}(t) &= \kappa_{\mathrm{lo}} + (\kappa_{\mathrm{hi}} - \kappa_{\mathrm{lo}})\,\sigma\!\bigl(\mat{V}\vect{c}(t) + \vect{\mu}\bigr), \\
+\vect{e}(t) &= \vect{k}(\vect{\omega}_t) \odot \vect{\kappa}(t),
+\end{aligned}
+\end{equation}
+with $\mat{V}$ the spatial eigenvectors, $\mat{\Phi}$ the temporal basis of Approach 4 augmented by cumulative step columns at known earthquakes and an exponential afterslip column per event with learned decay, rotations static, stepped at earthquakes, or on a random walk in time, a learned temporal length scale, and Student-$t$ noise. For unknown onsets, replace the smooth basis by a regularized horseshoe prior on $\Delta\vect{c}$.
+
+Sampling with NUTS is hours on a regional model and the sigmoid transform produces funnel geometries when the length scale is learned. The pragmatic path is a MAP or variational fit for the monitoring product, seeded from the per-epoch bounded solutions, with NUTS at a fixed length scale for a final uncertainty pass on a subset of epochs. With the likelihood written in the compressed form \eqref{eq:suffstat} it is an $n \times n$ quadratic form per gradient rather than a $10^5$-row matrix product per draw. This is the only approach that yields honest credible intervals on $\kappa(t)$.
+
+\section{The actual problem: per-epoch bounds on every mesh and time-varying rotations}
+\label{sec:actual}
+
+Three features of our problem were not in view when Sections~\ref{sec:cost} and the approach descriptions were first drafted.
+\begin{enumerate}[nosep]
+\item The coupling bounds are \emph{known} but \emph{differ at each epoch}: $\kappa_{\mathrm{lo},j}(t)$ and $\kappa_{\mathrm{hi},j}(t)$ are given per triangle and per epoch, encoding, for example, a region allowed to slip faster than the plate rate after an earthquake.
+\item Bounds apply on \emph{every} mesh, not only on a target mesh.
+\item Block rotations $\vect{\omega}_t$ \emph{may change from epoch to epoch}.
+\end{enumerate}
+
+\subsection{Effect on the cost model}
+
+\paragraph{Bounds on every mesh remove S3.}
+Every epoch carries the full constraint set, of order $8\,n_{\mathrm{tde}}$ rows. This is the per-epoch floor for any constraint-based method; nothing in the temporal design reduces it. The only escape is a formulation that replaces constraints by transforms (Approach~6 and its MAP variant below), whose per-epoch cost is a number of gradient evaluations rather than an interior-point solve.
+
+\paragraph{Time-varying rotations remove S2 as stated.}
+The kinematic rate $\vect{k}_t = \mat{S}\mat{R}\vect{\omega}_t$ changes with $t$, so the coupling constraint is bilinear at every epoch and the bowtie is needed per epoch, with per-epoch anchors. The replacement is \emph{anchor warm-starting}. Set the anchors at epoch $t$ from the converged kinematic rate at $t-1$ with a trust radius at least as large as the expected per-epoch change,
+\begin{equation}
+k^{\mathrm{lo}}_{j}(t) = k_j(t-1) - \delta_j, \qquad k^{\mathrm{hi}}_{j}(t) = k_j(t-1) + \delta_j, \qquad \delta_j \ge \mathbb{E}\,|\Delta k_j|.
+\end{equation}
+When both anchors share a sign the per-epoch envelope is convex from the first iteration, and the gap between the envelope and the true constraint scales as $\delta_j(\kappa_{\mathrm{hi}} - \kappa_{\mathrm{lo}})$, so one or two tightening steps replace twenty. A block-coordinate alternative exists (with $\vect{\omega}$ fixed the constraint is linear in $\vect{a}$; with $\vect{a}$ fixed and the sign of $k_j$ known it is linear in $\vect{\omega}$), but the warm-started bowtie optimizes jointly and reuses existing code.
+
+\paragraph{S1 and S4 are unaffected.}
+Compression to sufficient statistics and build-once remain the largest savings. Per-epoch, per-triangle bounds are already parameters of the constraint construction; the one code change is that the scalar bound object becomes a per-triangle array.
+
+\subsection{Time-varying bounds as information}
+
+Known bound changes are known regime changes. Temporal priors should break there, with the difference across a bound-change epoch exempted or down-weighted, exactly as at an earthquake epoch.
+
+The quantity that remains comparable across a bound change is the \emph{normalized coupling}, the position within the current interval,
+\begin{equation}
+u_j(t) = \frac{\kappa_j(t) - \kappa_{\mathrm{lo},j}(t)}{\kappa_{\mathrm{hi},j}(t) - \kappa_{\mathrm{lo},j}(t)} \in [0,1].
+\label{eq:normalized}
+\end{equation}
+Post-hoc smoothing (Approach~1a) should act on $\logit u_j(t)$. In transform-based formulations the latent field is exactly $\logit u$, so a temporal prior on the latent is a prior on normalized coupling that survives bound changes automatically. In quadratic-program formulations $u$ is not linear in the state, so exemptions at bound-change epochs are the practical substitute.
+
+Tight, informative per-epoch bounds also carry much of the temporal prior themselves. Where the interval is narrow the data have little left to determine and the temporal regularizer matters little. The simplest path, independent bounded epochs followed by post-hoc smoothing of normalized coupling, may therefore be adequate for much of the model, and should be tested before anything more elaborate is built.
+
+\subsection{Consequences for each approach}
+
+\begin{description}[style=nextline,nosep,leftmargin=1.5em]
+\item[Approach 1, post-hoc fusion.] Unchanged, applied to $\logit u_j(t)$ with breaks at bound-change epochs.
+\item[Approach 2, consensus ADMM.] Restored to the first tier. It is the only method that imposes a joint temporal prior while keeping every per-epoch problem at its native size with its own bounds and its own warm-started anchors. Rotations acquire a temporal smoother in the $\vect{z}$-step: a random walk penalty on $\Delta\vect{\omega}_t$ for slow change, or total variation for piecewise-constant rate changes. The cost is $K$ outer iterations times $T$ per-epoch programs, parallel over $T$, with anchors converging across outer iterations so that later iterations need one solve per epoch.
+\item[Approach 3, joint program.] Of order $T \times 10^6$ constraint rows with per-epoch rotations. Reference only, at a handful of epochs.
+\item[Approach 4, low-rank temporal basis.] Loses its advantage. Constraints remain per epoch on every mesh, and with $\vect{\omega}_t$ also expanded in the basis the constraint is bilinear in the two coefficient sets and still needs per-epoch anchors. It survives only with constraint collocation, enforcing bounds at a subset of epochs and checking the rest a posteriori, which is not guaranteed.
+\item[Approach 5, constrained filter.] The natural streaming form. Per-epoch bounds enter directly, anchors are warm-started from $t-1$, and the process noise $\mat{Q}_\omega$ governs how fast rotations may change. Cost is $T$ sequential per-epoch programs.
+\item[Approach 6, transform-based.] Rises sharply. Per-epoch bounds on every mesh and time-varying rotations cost nothing in formulation,
+\begin{equation}
+\vect{\kappa}_m(t) = \vect{\kappa}_{\mathrm{lo},m}(t) + \bigl(\vect{\kappa}_{\mathrm{hi},m}(t) - \vect{\kappa}_{\mathrm{lo},m}(t)\bigr) \odot \sigma\!\bigl(\vect{f}_m(t)\bigr), \qquad
+\vect{e}_m(t) = \vect{k}_m(\vect{\omega}_t) \odot \vect{\kappa}_m(t),
+\end{equation}
+with no bowtie and the bilinearity handled exactly. With the likelihood in compressed form \eqref{eq:suffstat}, each gradient costs $O(n_{\mathrm{params}}^2)$ per epoch plus the mesh transforms. The price is nonconvexity and sigmoid saturation at hard bounds. Run first as a MAP fit by a quasi-Newton method, initialized from the per-epoch bounded solutions through $\vect{f} = \logit u$ with clipping, then with NUTS at fixed hyperparameters for uncertainty. \code{celeri}'s existing MCMC path implements the single-epoch version of this parameterization.
+\end{description}
+
+\subsection{Two production candidates}
+
+The decision narrows to two formulations that both honor per-epoch bounds on every mesh and time-varying rotations (Table~\ref{tab:candidates}). They should be run on the same benchmark and chosen by result.
+
+\begin{table}[h]
+\centering
+\small
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{3.0cm}>{\raggedright\arraybackslash}p{5.6cm}>{\raggedright\arraybackslash}p{5.6cm}@{}}
+\toprule
+ & Warm-started bowtie QPs + consensus ADMM (Approach 2) & Sigmoid-parameterized MAP on compressed statistics (Approach 6, MAP) \\
+\midrule
+Bounds & exact, via convex envelope tightened per epoch & exact, via transform; approached asymptotically at hard bounds \\
+Bilinearity & convexified per epoch; anchors warm-started; nonconvex until anchors share sign & handled exactly; problem is nonconvex throughout \\
+Per-epoch cost & one to three interior-point solves with $\sim 8 n_{\mathrm{tde}}$ rows & hundreds of gradient evaluations, each $O(n_{\mathrm{params}}^2)$ plus mesh transforms \\
+Temporal prior & any convex $\mathcal{R}$ on $\Delta\vect{a}_t$, $\Delta\vect{\omega}_t$ in the $\vect{z}$-step & any differentiable prior on the latent $\vect{f}_m(t)$ and on $\vect{\omega}_t$; survives bound changes \\
+Rotations in time & smoothed in the $\vect{z}$-step & explicit random walk or basis \\
+Initialization & independent per-epoch solves (first iterate) & same, mapped through $\logit u$ \\
+Guarantees & convergence once anchors are frozen & local optimum; multiple starts advised \\
+Uncertainty & none (reduced Hessian a posteriori) & NUTS on the same model \\
+Existing code & \code{build\_cvxpy\_problem}, \code{SlipRateLimitItem} & \code{solve\_mcmc} coupling component and transform \\
+\bottomrule
+\end{tabular}
+\caption{The two production candidates that satisfy all three problem features.}
+\label{tab:candidates}
+\end{table}
+
+\section{Comparison and recommendation}
+
+\subsection{What is compared across time}
+
+Eigenmode coefficients $\vect{a}(t)$ are the numerically convenient state: linear in the operators and filter-friendly, but meaningful only on a frozen basis. Elastic slip rate $\vect{e}(t) = \mat{E}\vect{a}(t)$ is basis-free and physical but unbounded, and conflates block motion with coupling. Coupling $\vect{\kappa}(t)$ is dimensionless, bounded, invariant to the basis and to rotation changes, and is the quantity to report. Every approach should carry state in $\vect{a}$ (and $\vect{\omega}$) and report in $\vect{\kappa}$ with the resolvability mask.
+
+\subsection{Ranking}
+
+Table~\ref{tab:ranking} summarizes the six approaches for our problem: per-epoch known bounds on every mesh, time-varying rotations, and the cost model of Section~\ref{sec:cost} with savings S1 and S4 in place.
+
+\begin{table}[h]
+\centering
+\small
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{3.1cm}>{\raggedright\arraybackslash}p{3.0cm}>{\raggedright\arraybackslash}p{2.6cm}>{\raggedright\arraybackslash}p{2.9cm}>{\raggedright\arraybackslash}p{3.0cm}@{}}
+\toprule
+Approach & Fidelity to bounded physics & Effort & Robustness / tuning & Uncertainty on $\kappa(t)$ \\
+\midrule
+1. Post-hoc fusion (on normalized coupling) & low; biased at active bounds & about a day & easy & 1-D bands (1a); none honest (1b) \\
+2. Consensus ADMM, warm-started bowties & exact bounds every epoch & medium: proximal term, per-triangle bounds, anchor warm start, $\vect{z}$-prox & good scaling; $\rho$, $\delta$, anchor freezing & none \\
+3. Joint QP & exact & medium & out at scale; reference at $T \le 5$ & none \\
+4. Low-rank basis & good only with collocation & low to medium & bounds not guaranteed between knots & none \\
+5. Constrained filter & exact per epoch; streaming & about 200 lines plus a smoothing pass & only $\mat{Q}$ and $\delta$ & Laplace-quality, one-sided at bounds \\
+6. Transform-based MAP, then NUTS & exact via transform & about a week plus tuning & nonconvex; saturation; multiple starts & full posterior with NUTS \\
+\bottomrule
+\end{tabular}
+\caption{Comparison for the actual problem (Section~\ref{sec:actual}).}
+\label{tab:ranking}
+\end{table}
+
+\subsection{Which is most appropriate}
+
+The recommendation has three parts, in order.
+
+\begin{enumerate}
+\item \textbf{Immediately: Approach 1 on the runs that already exist, applied to normalized coupling \eqref{eq:normalized} with breaks at bound-change epochs.} It costs nothing beyond what has been computed, and because the per-epoch bounds are informative it may already be adequate over much of the model. Its failures map where bounds are active and a joint method is required. Its one prerequisite is a pinned basis.
+
+\item \textbf{Production, batch: run the two candidates of Table~\ref{tab:candidates} on the same benchmark and choose by result.} Consensus ADMM with warm-started bowties is the conservative choice: it reuses the existing bounded solver almost verbatim, enforces bounds exactly, and has a convergence guarantee once anchors are frozen, at the cost of $K \times T$ interior-point solves. The sigmoid-parameterized MAP fit is the aggressive choice: bounds, bilinearity, per-epoch bound changes and time-varying rotations are all handled exactly in the formulation with no envelope and no anchors, and each gradient is cheap once the data are compressed, at the cost of nonconvexity and saturation. Which is faster per epoch at full scale depends on whether an interior-point solve with $\sim 8 n_{\mathrm{tde}}$ rows or a few hundred $O(n_{\mathrm{params}}^2)$ gradients is cheaper, which the Stage~0a profile will decide.
+
+\item \textbf{Production, streaming: Approach 5.} Ingest each new epoch with one warm-started bounded solve carrying the previous posterior as a prior, then run the batch method periodically as the smoother.
+\end{enumerate}
+
+Uncertainty comes from NUTS on the transform-based model, seeded from the MAP fit, on as many epochs as is affordable. The joint program serves only as the exact reference at a handful of epochs, and the low-rank basis is dropped unless constraint collocation proves acceptable on the benchmark. The earlier recommendation to fix rotations and localize to one mesh is withdrawn for this problem; it remains the right shortcut for problems where those assumptions hold.
+
+\section{Staged path}
+
+\begin{table}[h]
+\centering
+\small
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}c>{\raggedright\arraybackslash}p{7.2cm}>{\raggedright\arraybackslash}p{6.4cm}@{}}
+\toprule
+Stage & Deliverable & Gate \\
+\midrule
+0a & Phase-by-phase profile of one large run with peak memory & Know which of operators / QR / canonicalization / SQP dominates time and memory \\
+0b & Basis pinning; on-disk cache of $\mat{H}_t$, $\vect{g}_t$ and of the static solution; per-triangle, per-epoch bound arrays; anchor warm-start interface & A second epoch of a large model solves in minutes with no operator or QR recompute and at most three tightening steps \\
+1 & Time-series container stacking existing runs; Approach 1 on normalized coupling & Smoothed stack beats independent epochs on coupling error with no new bound violations \\
+2 & Consensus ADMM and sigmoid MAP, both on a real-geometry synthetic whose truth has time-varying bounds and time-varying rotations & One candidate beats Stage 1 on onset timing and coupling error at acceptable wall time per epoch; choose it \\
+3 & Real epochs on all meshes with the chosen candidate; Approach 5 for new epochs as they arrive & Recovered transients match independently known slow slip events; residuals stationary \\
+4 & NUTS on the transform-based model, seeded from the MAP fit & 90\% interval coverage of at least 85\% on the benchmark \\
+\bottomrule
+\end{tabular}
+\caption{Staged path with decision gates.}
+\end{table}
+
+Two benchmarks should be scored by a single script before any method is believed: an upgraded two-dimensional toy with rigid blocks, a pinned eigenbasis of about a dozen modes, two overlapping slow slip events, one earthquake, and afterslip; and a real-geometry synthetic built from the Japan test model in which a prescribed $\kappa(t)$, a prescribed schedule of bound changes, and a prescribed $\vect{\omega}_t$ are pushed through the existing operators to produce noisy velocities per epoch. Metrics are coupling error per triangle and epoch, transient onset timing error, block-rate recovery, bound violations counted on the nonlinear coupling rather than its convex proxy, wall time, and, for the Bayesian approach, interval coverage. The decision rule at each gate: if a method fails on the toy but passes on the real-geometry synthetic, fix the toy; if it fails on the real-geometry synthetic, drop the method.
+
+\end{document}
